@@ -69,16 +69,28 @@ class SkySenseWorker(BaseToolWorker):
             **kwargs
         )
 
+    # def init_model(self):
+    #     logger.info(f"Initializing {self.model_name} worker (API Mode)...")
+    #     # 轻量连通性检查（不阻塞启动）
+    #     try:
+    #         base_url = self.skysense_api_url.rsplit("/", 1)[0]
+    #         resp = requests.get(f"{base_url}/health", timeout=5)
+    #         if resp.status_code == 200:
+    #             logger.info("SkySense API health check passed.")
+    #     except Exception as e:
+    #         logger.warning(f"SkySense API health check skipped: {e}")
     def init_model(self):
-        logger.info(f"Initializing {self.model_name} worker (API Mode)...")
-        # 轻量连通性检查（不阻塞启动）
-        try:
-            base_url = self.skysense_api_url.rsplit("/", 1)[0]
-            resp = requests.get(f"{base_url}/health", timeout=5)
-            if resp.status_code == 200:
-                logger.info("SkySense API health check passed.")
-        except Exception as e:
-            logger.warning(f"SkySense API health check skipped: {e}")
+    logger.info(f"Initializing {self.model_name} worker (API Mode)...")
+    try:
+        # 严格探测外部 API
+        base_url = self.smarties_api_url.rsplit("/", 1)[0]
+        resp = requests.get(f"{base_url}/health", timeout=5)
+        resp.raise_for_status()
+        self.api_connected = True  # ✅ 标记连通
+        logger.info("Smarties API health check passed.")
+    except Exception as e:
+        self.api_connected = False # ❌ 标记断开
+        logger.error(f"Smarties API health check FAILED: {e}")
 
     def generate(self, params):
         required_keys = ("image", "text")
