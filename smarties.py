@@ -1,11 +1,9 @@
 import os
 import uuid
 import argparse
-import base64
-import numpy as np
-from io import BytesIO
-from PIL import Image
 import requests
+from PIL import Image
+from io import BytesIO
 
 from tool_server.tool_workers.online_workers.base_tool_worker import BaseToolWorker
 from tool_server.utils.server_utils import build_logger
@@ -21,7 +19,7 @@ class SmartiesWorker(BaseToolWorker):
                  no_register=False,
                  model_name="Smarties",
                  device="cpu",
-                 smarties_api_url="http://10.202.80.17:8001/segment",  # ⚠️ 替换为实际 API 地址
+                 smarties_api_url="http://10.202.80.17:8001/segment",
                  limit_model_concurrency=5,
                  host="0.0.0.0",
                  port=None,
@@ -29,13 +27,12 @@ class SmartiesWorker(BaseToolWorker):
                  wait_timeout=120.0,
                  task_timeout=60.0,
                  api_timeout=30.0,
-                 output_dir="smarties_segmentation_outputs",
-                 **kwargs
+                 save_path="./smarties_outputs",
                  ):
+        # ✅ 自定义参数在 super() 前赋值
         self.smarties_api_url = smarties_api_url.rstrip("/")
         self.api_timeout = api_timeout
-        self.output_dir = output_dir
-        os.makedirs(self.output_dir, exist_ok=True)
+        self.save_path = save_path
 
         super().__init__(
             controller_addr=controller_addr,
@@ -54,12 +51,11 @@ class SmartiesWorker(BaseToolWorker):
             model_semaphore=model_semaphore,
             wait_timeout=wait_timeout,
             task_timeout=task_timeout,
-            **kwargs
+            args=None,
         )
 
     def init_model(self):
         logger.info(f"Initializing {self.model_name} worker (API Mode)...")
-        # 轻量连通性检查
         try:
             base_url = self.smarties_api_url.rsplit("/", 1)[0]
             resp = requests.get(f"{base_url}/health", timeout=5)
@@ -69,92 +65,67 @@ class SmartiesWorker(BaseToolWorker):
             logger.warning(f"Smarties API health check skipped: {e}")
 
     def generate(self, params):
-        required_keys = ("image",)
-        missing = [k for k in required_keys if k not in params]
-        if missing:
-            return {"text": f"Missing required parameter(s): {', '.join(missing)}", "error_code": 2}
+        if "image" not in params:
+            return {"text": "Missing required parameter: image", "error_code": 2}
 
-        image = params["image"]
-        text = params.get("text", "segment")  # 默认提示词，按需覆盖
-        
-        # ✅ 严格按要求的 payload 格式
-        payload = {"image": image, "text": text}
+        image_input = params["image"]
+        payload = {"image": image_input}
 
         try:
-            # 复用 BaseToolWorker 已封装的 call_api
-            result = self.call_api(
-                url=self.smarties_api_url,
-                payload=payload,
-                method="POST",
+            # 1. 请求 API，获取二进制图像流
+            resp = requests.post(
+                self.smarties_api_url,
+                json=payload,
                 headers={"User-Agent": "SmartiesWorker"},
                 timeout=self.api_timeout
             )
+            resp.raise_for_status()
+            
+            # 2. 将二进制流直接转换为 PIL Image 对象
+            result_img = Image.open(BytesIO(resp.content))
 
-            # 解析并保存分割掩码
-            mask_paths = self._parse_and_save_masks(result)
-            output_text = ", ".join(mask_paths) if mask_paths else "No valid segments generated"
-            return {"text": output_text, "error_code": 0}
+            # 3. 严格参考你提供的保存样式
+            if os.path.exists(image_input):
+                image_name = os.path.basename(os.path.splitext(image_input)[0])
+            else:
+                # 兼容 base64 或远程 URL 输入
+                image_name = f"smarties_input_{uuid.uuid4().hex[:8]}"
+                
+            new_filename = f"{image_name}_smarties_seg.png"
+            
+            if self.save_path and os.path.isdir(self.save_path):
+                save_path = os.path.join(self.save_path, new_filename)
+            else:
+                if self.save_path:
+                    logger.warning(f"Save path '{self.save_path}' is not a valid directory. "
+                                   f"Falling back to default ./smarties_outputs/")
+                save_dir = os.path.join(os.getcwd(), "smarties_outputs")
+                os.makedirs(save_dir, exist_ok=True)
+                save_path = os.path.join(save_dir, new_filename)
+            
+            result_img.save(save_path)
+
+            # 4. 返回格式完全对齐你的示例
+            txt = f"Segmented image saved to {new_filename}"
+            return {"text": txt, "image": save_path, "error_code": 0}
 
         except requests.exceptions.Timeout:
             return {"text": "Smarties API request timed out", "error_code": 4}
         except Exception as e:
-            logger.error(f"Smarties API call failed: {e}")
-            return {"text": f"Error calling Smarties API: {str(e)}", "error_code": 4}
-
-    def _parse_and_save_masks(self, result: dict) -> list:
-        """
-        兼容解析 Smarties API 返回的掩码数据（base64 / numpy array / 文件路径）
-        并统一保存到本地 output_dir，返回文件路径列表。
-        """
-        masks_data = result.get("masks", result.get("results", result.get("segments", [])))
-        if not masks_data:
-            logger.warning(f"No masks found in Smarties response: {result}")
-            return []
-
-        saved_paths = []
-        for i, mask_item in enumerate(masks_data):
-            try:
-                mask_path = os.path.join(self.output_dir, f"smarties_mask_{uuid.uuid4().hex[:8]}_{i}.png")
-                
-                if isinstance(mask_item, dict):
-                    if "base64" in mask_item:
-                        img_bytes = base64.b64decode(mask_item["base64"])
-                        Image.open(BytesIO(img_bytes)).save(mask_path)
-                    elif "array" in mask_item or "mask" in mask_item:
-                        arr = np.array(mask_item.get("array", mask_item.get("mask")))
-                        if arr.max() <= 1.0:
-                            arr = (arr * 255).astype(np.uint8)
-                        Image.fromarray(arr.astype(np.uint8), mode="L").save(mask_path)
-                elif isinstance(mask_item, (list, np.ndarray)):
-                    arr = np.array(mask_item)
-                    if arr.max() <= 1.0:
-                        arr = (arr * 255).astype(np.uint8)
-                    Image.fromarray(arr.astype(np.uint8), mode="L").save(mask_path)
-                elif isinstance(mask_item, str) and os.path.exists(mask_item):
-                    # API 直接返回了已有路径，软链接或直接记录
-                    saved_paths.append(mask_item)
-                    continue
-                else:
-                    continue
-                    
-                saved_paths.append(mask_path)
-            except Exception as e:
-                logger.warning(f"Failed to parse/save mask {i}: {e}")
-                continue
-
-        return saved_paths
+            txt_e = f"Error in SmartiesWorker: {e}"
+            logger.error(txt_e)
+            return {"text": txt_e, "error_code": 1}
 
     def get_tool_instruction(self):
         return {
             "type": "function",
             "function": {
                 "name": "Smarties",
-                "description": "Perform image segmentation using the Smarties API. Returns local paths to saved mask PNG files.",
+                "description": "Segmentation model that takes an input image and returns a processed/segmented output image.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "image": {"type": "string", "description": "Image path or base64 string"},
-                        "text": {"type": "string", "description": "Segmentation prompt or target object description (optional)"}
+                        "image": {"type": "string", "description": "Local path or base64 string of the input image"}
                     },
                     "required": ["image"]
                 },
@@ -172,7 +143,7 @@ if __name__ == "__main__":
     parser.add_argument("--limit-model-concurrency", type=int, default=5)
     parser.add_argument("--smarties-api-url", type=str, default="http://10.202.80.17:8001/segment")
     parser.add_argument("--api-timeout", type=int, default=30)
-    parser.add_argument("--output-dir", type=str, default="smarties_segmentation_outputs")
+    parser.add_argument("--save-path", type=str, default="./smarties_outputs")
     parser.add_argument("--no-register", action="store_true")
     args = parser.parse_args()
 
@@ -187,7 +158,7 @@ if __name__ == "__main__":
         host=args.host,
         port=args.port,
         api_timeout=args.api_timeout,
-        output_dir=args.output_dir,
+        save_path=args.save_path,
         no_register=args.no_register,
     )
     worker.run()
