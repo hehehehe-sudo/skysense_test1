@@ -6,3 +6,18 @@ pip install fastapi uvicorn pyyaml box
 
 # 启动服务（监听本机所有网卡，端口 8000）
 uvicorn server_api:app --host 0.0.0.0 --port 8000
+
+
+# 1. 启动服务
+uvicorn server_api:app --host 0.0.0.0 --port 8000 --reload
+
+# 2. 启动后端服务
+curl -X POST http://localhost:8000/start
+
+# 3. 查看状态
+curl http://localhost:8000/status
+
+# 4. 调用工具
+curl -X POST http://localhost:8000/invoke/ChangeDetection \
+  -H "Content-Type: application/json" \
+  -d '{"input_data": "sample.json", "threshold": 0.8}'
