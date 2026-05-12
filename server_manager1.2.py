@@ -1,3 +1,4 @@
+# server_manager.py
 import os
 import time
 import subprocess
@@ -6,16 +7,16 @@ import copy
 from pathlib import Path
 import requests
 import signal
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Callable
 from box import Box
 import argparse
 import yaml
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 # 保持与你原路径一致
 try:
     from tool_server.utils.utils import load_json_file, write_json_file
 except ImportError:
-    # 兼容本地测试直接运行的情况
     def load_json_file(path): 
         import json
         with open(path, 'r') as f: return json.load(f)
@@ -24,9 +25,8 @@ except ImportError:
         with open(path, 'w') as f: json.dump(data, f, indent=2)
 
 class ServerManager:
-    """Server Manager Class for local process management (API-Safe Version)"""
+    """统一服务管理器：整合进程生命周期管理 + 在线工具调用路由"""
     def __init__(self, config: Optional[Dict] = None):
-        # Initialize configuration
         self.config = Box(config)
         self.logger = self._setup_logger()
         self.log_folder = Path(self.config.log_folder)
@@ -34,21 +34,22 @@ class ServerManager:
         self.tools_output_dir = Path(self.config.tools_output_dir)
         self.tools_output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Initialize status
         self.controller_addr = None
         self._clean_environment()
         
-        # ✅ 关键修改 1：移除 os.chdir()，改为保存绝对路径，避免污染全局进程状态
         self.base_dir = Path(self.config.base_dir).resolve()
         self.base_dir.mkdir(parents=True, exist_ok=True)
         
         self.controller_config = self.config.controller_config
         self.model_worker_config = self.config.model_worker_config if "model_worker_config" in self.config else []
         self.tool_worker_config = self.config.tool_worker_config if "tool_worker_config" in self.config else []
-        self.processes = []  # Track all started processes
+        self.processes = []
+
+        # ================= 工具指令缓存 =================
+        self.tool_instructions: Dict[str, dict] = {}  # {tool_name: instruction_dict}
+        self.headers = {"Content-Type": "application/json"}
 
     def _setup_logger(self) -> logging.Logger:
-        """Set up logging system"""
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s'
@@ -56,12 +57,10 @@ class ServerManager:
         return logging.getLogger(__name__)
 
     def _clean_environment(self) -> None:
-        """Clean environment variables"""
         os.environ["OMP_NUM_THREADS"] = "1"
 
     def run_local_command(self, job_name: str, command: List[str], log_file: str, 
                           conda_env: str = None, cuda_visible_devices: str = None) -> subprocess.Popen:
-        """Run command locally"""
         env = os.environ.copy()
         if cuda_visible_devices:
             env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
@@ -73,12 +72,10 @@ class ServerManager:
         
         self.logger.info(f"Starting process: {job_name} with command: {' '.join(cmd)} in cwd: {self.base_dir}")
         with open(log_file, 'w') as f:
-            # ✅ 关键修改 2：使用 cwd 参数指定子进程工作目录，替代全局 os.chdir()
             process = subprocess.Popen(cmd, stdout=f, stderr=f, env=env, cwd=str(self.base_dir))
             return process
 
     def wait_for_process(self, process, job_name: str) -> dict:
-        """Wait for process to initialize"""
         self.logger.info(f"Waiting for process to start: {job_name}")
         time.sleep(2)
         if process.poll() is not None:
@@ -88,7 +85,6 @@ class ServerManager:
         return {"process": process, "pid": process.pid}
 
     def wait_for_worker_addr(self, worker_name: str) -> str:
-        """Wait for worker address to be available"""
         self.logger.info(f"Waiting for {worker_name} worker...")
         attempt = 0
         while True:
@@ -126,12 +122,9 @@ class ServerManager:
         raise RuntimeError("Controller failed to become ready.")
 
     def start_controller(self) -> str:
-        """Start controller"""
-        # ✅ 关键修改 3：深拷贝配置避免 pop() 污染原始 config，保证 API 可重复调用
         ctrl_cfg = copy.deepcopy(self.controller_config)
         log_file = self.log_folder / f"{ctrl_cfg.worker_name}.log"
         
-        # 安全提取 script-addr
         cmd_dict = dict(ctrl_cfg.cmd)
         script_addr = cmd_dict.pop("script-addr")
         job_name = ctrl_cfg.job_name
@@ -169,7 +162,6 @@ class ServerManager:
         return self.controller_addr
 
     def start_all_workers(self) -> None:
-        """Start all worker services"""
         self.start_model_worker()
         self.start_tool_worker()
 
@@ -184,8 +176,6 @@ class ServerManager:
             self.start_worker_by_config(cfg)
     
     def start_worker_by_config(self, config) -> None:
-        """Start specific worker"""
-        # ✅ 同样使用深拷贝保护原始配置
         worker_cfg = copy.deepcopy(config)
         log_file = self.log_folder / f"{worker_cfg.worker_name}_worker.log"
         
@@ -209,11 +199,48 @@ class ServerManager:
         self.processes.append({"name": job_name, "process": process})
         self.wait_for_process(process, job_name)
         
+        # 如果是 tool worker（配置了 wait_for_self），则获取其指令并缓存
         if worker_cfg.get("wait_for_self", False):
-            self.wait_for_worker_addr(worker_cfg.worker_name)
+            worker_addr = self.wait_for_worker_addr(worker_cfg.worker_name)
+            self._fetch_tool_instruction(worker_cfg.worker_name, worker_addr)
+    
+    def _fetch_tool_instruction(self, tool_name: str, worker_addr: str) -> None:
+        """从 worker 获取工具指令并缓存。优先 GET，回退 POST。"""
+        # 尝试 GET 请求
+        try:
+            resp = requests.get(f"{worker_addr}/tool_instruction", timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                instruction = data.get("tool_instruction")
+                if instruction:
+                    self.tool_instructions[tool_name] = instruction
+                    self.logger.info(f"Cached instruction for tool: {tool_name}")
+                    return
+        except Exception as e:
+            self.logger.debug(f"GET /tool_instruction failed for {tool_name}: {e}")
+        
+        # 回退到 POST 请求（兼容旧版）
+        try:
+            resp = requests.post(f"{worker_addr}/tool_instruction", json={}, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                instruction = data.get("tool_instruction")
+                if instruction:
+                    self.tool_instructions[tool_name] = instruction
+                    self.logger.info(f"Cached instruction for tool: {tool_name} (via POST)")
+                    return
+        except Exception as e:
+            self.logger.debug(f"POST /tool_instruction failed for {tool_name}: {e}")
+        
+        self.logger.warning(f"Failed to fetch tool instruction for {tool_name} from {worker_addr}")
+
+    def get_tool_instruction(self, tool_name: str) -> dict:
+        """返回指定工具的 instruction。若不存在，返回错误信息。"""
+        if tool_name not in self.tool_instructions:
+            return {"error_code": 1, "text": f"Tool instruction for '{tool_name}' not found."}
+        return {"error_code": 0, "instruction": self.tool_instructions[tool_name]}
 
     def shutdown_services(self) -> None:
-        """Shut down all local processes"""
         try:
             if hasattr(self, 'controller_addr_location') and os.path.exists(self.controller_addr_location):
                 os.remove(self.controller_addr_location)
@@ -238,3 +265,58 @@ class ServerManager:
         except Exception as e:
             self.logger.error(f"Critical error during shutdown: {e}")
             raise
+
+    # ================= 工具调用：仅通过 Controller 路由在线工具 =================
+    def call_tool(self, tool_name: str, params: dict) -> dict:
+        """
+        统一在线工具调用入口：通过 Controller 获取 worker 地址，再请求 /worker_generate
+        线程安全超时控制
+        """
+        # 动态超时策略（可根据需要调整）
+        if tool_name in ["AddPoisLayer", "ComputeDistance"]:
+            timeout_sec = 180
+        elif tool_name in ["AddIndexLayer"]:
+            timeout_sec = 300
+        elif tool_name in ["ChangeDetection", "GetAreaBoundary"]:
+            timeout_sec = 120
+        else:
+            timeout_sec = 60
+
+        ret_message = {"text": f"Failed to call tool {tool_name} for unknown reason", "error_code": 1}
+
+        def _execute():
+            if not self.controller_addr:
+                return {"text": "Controller not available.", "error_code": 1}
+            try:
+                # 1. 通过 controller 获取 worker 地址
+                resp = requests.post(
+                    f"{self.controller_addr}/get_worker_address",
+                    json={"model": tool_name},
+                    timeout=5
+                )
+                resp.raise_for_status()
+                worker_addr = resp.json().get("address")
+                if not worker_addr:
+                    return {"text": f"Worker for tool {tool_name} not found.", "error_code": 1}
+                
+                # 2. 调用 worker 生成接口
+                target_url = f"{worker_addr.rstrip('/')}/worker_generate"
+                ret = requests.post(target_url, json=params, headers=self.headers, timeout=timeout_sec)
+                ret.raise_for_status()
+                return ret.json()
+            except Exception as e:
+                self.logger.error(f"Tool call failed for {tool_name}: {e}")
+                return {"text": f"Failed to call tool {tool_name}: {e}", "error_code": 1}
+
+        # 线程安全超时控制
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_execute)
+            try:
+                ret_message = future.result(timeout=timeout_sec)
+            except FuturesTimeoutError:
+                ret_message = {"text": f"Timeout calling tool {tool_name} after {timeout_sec}s", "error_code": 1}
+            except Exception as e:
+                self.logger.error(f"Tool execution thread error: {e}")
+                ret_message = {"text": f"Failed to call tool {tool_name}: {e}", "error_code": 1}
+
+        return ret_message
