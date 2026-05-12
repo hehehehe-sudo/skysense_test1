@@ -1,0 +1,8 @@
+conda activate tool-server-e1
+cd tool_server/tool_workers/scripts/launch_scripts
+
+# 安装 API 依赖（仅需一次）
+pip install fastapi uvicorn pyyaml box
+
+# 启动服务（监听本机所有网卡，端口 8000）
+uvicorn server_api:app --host 0.0.0.0 --port 8000
